@@ -212,9 +212,32 @@ YARN 会通过「注意力池化（Attention Pooling）」对早期上下文进�
 ✅ 生活对应：桌面始终保持 2000 个 “信息单元”（1000 条笔记 + 1000 本新书），不会溢出，且笔记能替代原书的核心信息。
 
 
+1.
+在 Word2Vec / Transformer 语义空间中，
+“语义”其实不是指某个具体坐标值，而是指：
+在这个空间里，两个词向量之间的相对位置关系。
+比如： king - man + woman ≈ queen
+这只依赖于方向和角度，不依赖于绝对坐标。
+所以 RoPE 做的事情就像：
+“给整个语义空间加了一个位置相关的旋转滤镜，
+让模型能区分顺序信息，
+但不破坏语义的几何结构。”
+
+2.
+RoPE 的作用是：
+“给整个语义空间加了一个位置相关的旋转滤镜，
+即添加一个正交的矩阵,使得整个空间随之变动,由于正交性,旋转后的向量角度相对不变,模长不变,并没有改变语义.
+让模型能区分顺序信息，
+但不破坏语义的几何结构。”
+
+3.
+
+
 Yarn-->RoPE->embedding-->word2verc
 为了让模型处理文本，需要将文本数值化，除了one-hot这种方式外，但这会有唯独灾难（有大量的无效的0，且不能表示语义），但如果用一种稠密向量表示单个词语(token)，让相似语义的词语(token)向量夹角较小，相同语义（语义较强的，模长的大，语义小的，模长小），
-但怎么做到呢？方法就是使用对比损失函数，训练模型，强迫模型将语义相似的，向量夹角相近。具体过程如下：
+但怎么做到呢？方法就是使用对比损失函数，训练模型，强迫模型将语义相似的，向量夹角相近。模型不会刻意控制每个维度的比例关系，而是让整体的方向关系通过优化内积来自然形成。语义由向量间的相对方向（单位向量 / 夹角 / cosine）确定；模长是强度
+所有向量之间的相对角度不变。语义依赖的是这种全局相对角度结构，因此语义保持。
+具体过程如下：
 我们用 SimCSE 训练句向量 的场景做实际训练例子 —— 这是对比学习（InfoNCE Loss）最经典的应用，全程还原 “数据准备→模型计算→损失优化→向量收敛” 的完整过程，每个步骤都对应公式，直观看到损失函数如何 “逼着” 向量满足语义约束。
 训练完毕后，相当于相同语义的，向量在同一附近，实际跟人的思想有点像，谈一个话题，相同语义的多个词，相继出现的概率大。
 模型不理解现实的意思，他只是明白根据前面的多个向量，向量的顺序，下一个向量应该是这个，然后输出，转换为人理解的词语，看着大模型似乎理解了，我的意思，实际上不是，只是那个向量被计算出是下一个向量的概率大。
@@ -535,29 +558,185 @@ class MiniMindBlock(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.head_dim = config.hidden_size // config.num_attention_heads
+        '''
+        self.self_attn(
+            归一化后的hidden_states, 
+            position_embeddings,  # 位置编码（补充词的顺序信息）
+            past_key_value, use_cache, attention_mask  # 缓存/掩码相关
+        )
+        计算 “自注意力”，让每个词能 “看到” 序列中其他相关词（比如预测 “苹果” 时，关注 “我爱吃”），捕捉上下文语义依赖。
+        hidden_states（经过注意力加权后的向量）+ present_key_value（注意力的 K/V 缓存，用于自回归生成时提速）。
+        '''
         self.self_attn = Attention(config)
 
         self.layer_id = layer_id
+        # 对 hidden_states 做 Layer Normalization（层归一化），让向量的均值接近 0、方差接近 1。
+        # 稳定训练过程，避免输入值过大 / 过小导致的梯度爆炸 / 消失，让注意力机制能更高效地学习上下文依赖。
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        '''
+        让模型 “直接保留原始特征”，同时叠加注意力学到的上下文特征，避免深层网络中特征被过度扭曲，加速训练收敛。
+        self.post_attention_layernorm(hidden_states)  # 第二次归一化
+        self.mlp(...)  # 多层感知机（MLP）
+        作用：
+            归一化：对 “注意力 + 残差” 后的向量再做一次 Layer Normalization，稳定 MLP 的输入；
+            MLP 处理：通过全连接层 + 激活函数（如 GELU），对每个词的向量做 “非线性特征增强”（比如把 “我” 和 “吃” 的特征组合成 “我吃” 的语义特征）。
+            为什么？：注意力块负责 “捕捉上下文关系”，MLP 块负责 “强化单个词的语义特征”，两者分工协作。
+        '''
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
+    '''
+    Pre-LN 范式下 Transformer 解码器层的标准顺序
+    
+    整体顺序总结（一句话串起来）
+    输入 → 保存残差 1 → 归一化 1 → 自注意力（捕捉上下文） → 残差 1 连接 → 归一化 2 → MLP（增强特征） → 残差 2 连接 → 输出
+    关键注意点（为什么顺序不能乱？）
+    归一化的位置（Pre-LN）：必须在注意力 / MLP 之前，否则会导致训练不稳定（梯度消失 / 爆炸），这是现在大模型（如 GPT、LLaMA）的标准设计；
+    残差连接的时机：每次经过注意力 / MLP 后，必须马上和 “该模块的原始输入” 做残差连接，否则无法发挥残差的作用；
+    注意力在前，MLP 在后：注意力负责 “全局上下文依赖”，MLP 负责 “局部特征非线性增强”，先捕捉关系再增强特征，符合语言模型的学习逻辑；
+    位置编码（position_embeddings）：作为注意力的输入之一，必须在注意力计算时加入（否则模型不知道词的顺序），但不参与归一化和残差连接（因为位置编码是固定 / 半固定的位置信息，不需要被模型 “修正”）。
+    '''
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        # 把当前层的原始输入存起来，后面用于 “残差连接”（Residual Connection）。
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
+            # 第一个MiniMindBlock的hidden_states是随机的embedding向量
             self.input_layernorm(hidden_states), position_embeddings,
             past_key_value, use_cache, attention_mask
         )
+        # 残差连接（Residual Connection）：原始输入 + 注意力输出
+        # 让模型 “直接保留原始特征”，同时叠加注意力学到的上下文特征，避免深层网络中特征被过度扭曲，加速训练收敛。
         hidden_states += residual
+        '''
+        作用：把 MLP 增强后的特征，和 “注意力 + 第一次残差” 的特征叠加，保留中间结果的同时，注入更复杂的非线性特征。
+        最终输出：经过 “注意力上下文捕捉 + MLP 特征增强” 的 hidden_states，以及用于生成加速的 present_key_value。
+
+        residual2 = hidden_states  # 保存注意力+第一次残差后的结果
+        mlp_output = self.mlp(self.post_attention_layernorm(hidden_states))
+        hidden_states = residual2 + mlp_output  # 第二次残差连接
+        '''
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
 
 
 class MiniMindModel(nn.Module):
+    '''
+    这是一个 **MiniMind 系列的因果语言模型（CausalLM）结构**（类似 GPT、LLaMA 等自回归大模型），用于文本生成任务（比如续写、问答）。下面从「整体结构」到「每层细节」，逐部分用通俗语言解释，兼顾技术准确性和易懂性：
+
+    ### 先明确核心定位
+    - **MiniMindForCausalLM**：最终对外提供的「因果语言模型」类（CausalLM = 因果语言模型，即通过前文预测下一个token，自回归生成）；
+    - 核心由两部分组成：`(model)` 是「特征提取 backbone（MiniMindModel）」，`(lm_head)` 是「最终文本生成的输出头」；
+    - 所有层的 `bias=False` 表示不使用偏置项，`dropout(p=0.0)` 表示未启用 dropout 正则化（可能是训练初期或推理阶段）。
+
+
+    ### 整体结构拆解（从外到内）
+    ```
+    MiniMindForCausalLM  # 总模型（因果语言模型）
+    ├─ (model): MiniMindModel  # 核心backbone（特征提取器）
+    │  ├─ (embed_tokens): Embedding(6400, 512)  # Token嵌入层
+    │  ├─ (dropout): Dropout(p=0.0)  # 嵌入层后的dropout（未启用）
+    │  ├─ (layers): ModuleList(8 x MiniMindBlock)  # 8层Transformer编码器块（核心计算层）
+    │  │  └─ 每层 MiniMindBlock（Transformer块）
+    │  │     ├─ (self_attn): Attention  # 多头注意力机制（这里是优化后的稀疏/分组注意力）
+    │  │     ├─ (input_layernorm): RMSNorm  # 注意力层前的归一化
+    │  │     ├─ (post_attention_layernorm): RMSNorm  # 注意力层后的归一化
+    │  │     └─ (mlp): FeedForward  # 前馈神经网络（特征非线性变换）
+    │  └─ (norm): RMSNorm  # 所有Transformer块输出后的最终归一化
+    └─ (lm_head): Linear(512, 6400)  # 语言模型头（将特征映射为token概率）
+    ```
+
+
+    ### 逐部分详细解释
+    #### 1. 最外层：MiniMindForCausalLM
+    - 作用：PyTorch `nn.Module` 的子类，是整个模型的「入口」，封装了 backbone 和输出头，对外提供 `forward()` 方法（接收文本token，输出下一个token的概率）；
+    - 核心逻辑：`文本token → embed_tokens（嵌入）→ MiniMindBlock×8（特征提取）→ norm（归一化）→ lm_head（预测token）`。
+
+    #### 2. (model): MiniMindModel（核心backbone）
+    - 作用：将输入的离散token（比如数字ID）转换为连续的「语义特征向量」，是模型的核心计算部分；
+    - 包含「嵌入层 → 8层Transformer块 → 最终归一化」的完整特征提取流程。
+
+    ##### 2.1 (embed_tokens): Embedding(6400, 512)
+    - 类型：词嵌入层（PyTorch `nn.Embedding`）；
+    - 参数含义：`(vocab_size=6400, embed_dim=512)` → 词汇表大小为 6400（模型能识别 6400 个不同的token），每个token被映射为 512 维的稠密向量（嵌入向量）；
+    - 作用：将离散的token ID（比如“你”对应 ID=123）转换为连续的、有语义的向量（512维），让模型能理解token的含义；
+    - 举例：输入token ID `[10, 25, 42]` → 输出形状 `(batch_size, seq_len, 512)` 的嵌入矩阵。
+
+    ##### 2.2 (dropout): Dropout(p=0.0, inplace=False)
+    - 作用：嵌入层后的正则化层，随机“关闭”部分神经元，防止模型过拟合；
+    - `p=0.0` 表示当前未启用（可能是推理阶段，或训练初期先不添加正则化）；
+    - `inplace=False` 表示不修改输入张量本身，而是返回新张量（避免覆盖原始数据）。
+
+    ##### 2.3 (layers): ModuleList(0-7): 8 x MiniMindBlock
+    - 类型：`nn.ModuleList` 是PyTorch的“模块容器”，存放 8 个结构相同的 `MiniMindBlock`（类似Transformer的编码器块）；
+    - 作用：8层堆叠是模型“深度”的体现——每一层都对嵌入特征做「注意力交互 + 非线性变换」，层层提炼更复杂的语义（比如从单个token含义→短语含义→句子逻辑）；
+    - 关键：8层是大模型的常见“轻量配置”（比如 LLaMA-7B 是 32 层，这里是简化版 MiniMind）。
+
+    ###### 2.3.1 单层 MiniMindBlock（Transformer核心块）
+    每个块包含「注意力层 + 两个归一化层 + 前馈网络」，是大模型的“基本计算单元”，顺序通常是：`归一化 → 注意力 → 残差连接 → 归一化 → 前馈网络 → 残差连接`（行业主流的 Pre-LN 结构）。
+
+    ##### 2.3.1.1 (input_layernorm): RMSNorm()
+    - 类型：Root Mean Square Normalization（均方根归一化）；
+    - 作用：在注意力层之前对输入特征做归一化，让特征的均值≈0、方差≈1，避免模型训练时梯度消失/爆炸，加速收敛；
+    - 优势：相比传统的 LayerNorm，RMSNorm 计算更高效（少了均值中心化步骤），是大模型中常用的归一化方式（比如 LLaMA、Qwen 都用 RMSNorm）。
+
+    ##### 2.3.1.2 (self_attn): Attention（注意力层）
+    - 作用：让每个token能“关注”输入序列中其他相关token的信息（比如“他喜欢苹果”中，“他”会关注“喜欢”和“苹果”），捕捉序列的依赖关系（比如语法、语义关联）；
+    - 内部结构（优化版注意力，非标准多头注意力）：
+    - `(q_proj): Linear(in_features=512, out_features=512, bias=False)`：将 512 维输入映射为「查询（Q）」（512维）；
+    - `(k_proj): Linear(in_features=512, out_features=128, bias=False)`：将 512 维输入映射为「键（K）」（128维）；
+    - `(v_proj): Linear(in_features=512, out_features=128, bias=False)`：将 512 维输入映射为「值（V）」（128维）；
+    - `(o_proj): Linear(in_features=512, out_features=512, bias=False)`：将注意力计算结果映射回 512 维（输出投影）；
+    - 关键：Q=512维，K/V=128维 → 这是「分组注意力」或「稀疏注意力」的优化设计（减少计算量），而非标准多头注意力（Q/K/V维度通常相同），适合轻量级模型。
+    - 辅助层：
+    - `(attn_dropout): Dropout(p=0.0)`：注意力权重的dropout（未启用）；
+    - `(resid_dropout): Dropout(p=0.0)`：注意力输出的残差连接前的dropout（未启用）。
+
+    ##### 2.3.1.3 (post_attention_layernorm): RMSNorm()
+    - 作用：注意力层输出后，再做一次归一化，为后续前馈网络的非线性变换做准备（Pre-LN 结构的标准步骤）。
+
+    ##### 2.3.1.4 (mlp): FeedForward（前馈神经网络）
+    - 作用：对注意力层输出的特征做「非线性变换」，提炼更复杂的语义信息（注意力负责“捕捉依赖”，MLP负责“强化特征”）；
+    - 内部结构（Gated MLP，门控前馈网络，比普通MLP更高效）：
+    - `(gate_proj): Linear(512, 1408, bias=False)`：门控投影层——将 512 维特征映射为 1408 维，控制信息传递（类似“开关”）；
+    - `(up_proj): Linear(512, 1408, bias=False)`：上采样投影层——同样将 512 维映射为 1408 维（与 gate_proj 输出做元素乘，实现门控）；
+    - `(act_fn): SiLUActivation()`：激活函数（Sigmoid Linear Unit）——引入非线性，让模型能学习复杂关系（比ReLU更适合大模型）；
+    - `(down_proj): Linear(1408, 512, bias=False)`：下采样投影层——将 1408 维特征映射回 512 维（与输入维度一致，方便残差连接）；
+    - `(dropout): Dropout(p=0.0)`：MLP输出的dropout（未启用）；
+    - 关键：1408 是隐藏层维度，通常是输入维度 512 的 2.75 倍（512×2.75=1408），是大模型中常用的隐藏层比例。
+
+    ##### 2.4 (norm): RMSNorm()
+    - 作用：8层 MiniMindBlock 堆叠后，对最终的特征做一次全局归一化，确保特征分布稳定，为后续输出头做准备。
+
+    #### 3. (lm_head): Linear(in_features=512, out_features=6400, bias=False)
+    - 类型：线性投影层（语言模型头）；
+    - 参数含义：`(in_features=512, out_features=6400)` → 接收 512 维的语义特征，映射为 6400 维的输出（与词汇表大小一致）；
+    - 作用：将 backbone 提取的语义特征，转换为「每个token在词汇表中的概率分数」——输出形状为 `(batch_size, seq_len, 6400)`，每个位置的 6400 个数值对应“该位置是词汇表中第 i 个token”的得分；
+    - 后续步骤：输出后会经过 `softmax` 函数，将得分转换为概率，模型选择概率最高的token作为“下一个要生成的token”（自回归生成的核心）。
+
+
+    ### 核心参数总结（快速掌握模型规模）
+    | 参数                | 数值       | 含义                                  |
+    |---------------------|------------|---------------------------------------|
+    | 词汇表大小          | 6400       | 模型能识别/生成的不同token数量        |
+    | 嵌入维度/模型维度   | 512        | 每个token的特征向量维度（模型核心维度）|
+    | Transformer块数量   | 8层        | 模型的深度（层数越多，建模能力越强）  |
+    | MLP隐藏层维度       | 1408       | 前馈网络的中间维度（512×2.75）        |
+    | 注意力层设计        | Q=512, K/V=128 | 优化版分组注意力（减少计算量）        |
+    | 归一化方式          | RMSNorm    | 高效稳定的归一化（大模型常用）        |
+    | 激活函数            | SiLU       | 非线性激活（适合大模型）              |
+
+
+    ### 模型工作流程（一句话概括）
+    输入文本 → 转换为token ID → `embed_tokens` 映射为 512 维嵌入向量 → 经过 8 层 `MiniMindBlock`（注意力捕捉依赖 + MLP强化特征）→ 最终 `RMSNorm` 归一化 → `lm_head` 投影为 6400 个token的概率 → 选择概率最高的token作为下一个生成的token，重复该过程实现文本续写。
+
+    这个模型是「轻量级大模型」（512维+8层），适合入门学习、小数据集训练或边缘设备部署，核心结构和 LLaMA、Qwen 等主流大模型一致，只是规模更小、计算量更低。
+    '''
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        # config.vocab_size 告诉 embedding 层 “总共有多少个不同的词需要映射”。为每个 token 分配一个唯一的向量
+        # config.hidden_size 这个维度决定了向量能 “承载多少语义信息”：维度越高（如 1024），理论上能区分的语义越精细，但模型参数也会越多（计算成本越高）。
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
