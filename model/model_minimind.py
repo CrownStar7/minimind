@@ -342,7 +342,33 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
     )
 
+'''
+| 名称                         | 缩写    | 含义             |
+| -------------------------- | ----- | -------------- |
+| batch size                 | **B** | 一批有多少句子        |
+| sequence length            | **T** | 每句 token 数     |
+| embedding dim / hidden dim | **D** | 每个 token 的特征维度 |
+| attention head             | **H** | 多头注意力的头数       |
 
+x.shape = (B, T, D)
+
+
+x = [x1, x2, x3, x4]
+
+      W (3×4):
+      [ w11 w12 w13 w14 ]   → neuron 1
+      [ w21 w22 w23 w24 ]   → neuron 2
+      [ w31 w32 w33 w34 ]   → neuron 3
+
+y = Wx + b:
+
+y1 = w11*x1 + w12*x2 + w13*x3 + w14*x4 + b1
+y2 = w21*x1 + w22*x2 + w23*x3 + w24*x4 + b2
+y3 = w31*x1 + w32*x2 + w33*x3 + w34*x4 + b3
+
+3 行 = 3 个神经元 = 3 个权重向量（但合成一个矩阵）
+
+'''
 class Attention(nn.Module):
     def __init__(self, args: MiniMindConfig):
         super().__init__()
@@ -587,7 +613,7 @@ class MiniMindBlock(nn.Module):
 
     '''
     Pre-LN 范式下 Transformer 解码器层的标准顺序
-    
+
     整体顺序总结（一句话串起来）
     输入 → 保存残差 1 → 归一化 1 → 自注意力（捕捉上下文） → 残差 1 连接 → 归一化 2 → MLP（增强特征） → 残差 2 连接 → 输出
     关键注意点（为什么顺序不能乱？）
