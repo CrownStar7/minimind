@@ -52,7 +52,6 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             scaler.update()
 
             optimizer.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
 
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
@@ -116,6 +115,32 @@ if __name__ == "__main__":
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    '''
+    根据运行设备（CPU/GPU），统一创建 “自动混合精度训练（AMP）的上下文管理器”
+    下面拆解开通俗解释，先明确关键概念：
+    1.上下文管理器：用 with 关键字触发，进入 with 块时执行初始化（比如启用 AMP），退出时执行清理（比如恢复默认精度），不用手动开关，很方便；
+    2.自动混合精度（AMP）：PyTorch 的 torch.cuda.amp 模块，核心是 “用半精度（FP16）做计算，用全精度（FP32）存梯度”—— 既能减少 GPU 显存占用、加快训练速度，又能避免精度丢失，仅支持 NVIDIA GPU（CPU 不支持）；
+    3.nullcontext：Python 内置的 “空上下文管理器”，进入 / 退出时啥也不做，纯粹是为了让 CPU 模式下的代码结构和 GPU 模式保持一致，不用写 if-else 分支。
+    
+    最终效果：
+    无论用 CPU 还是 GPU，后续都能统一用下面的代码结构：
+        with autocast_ctx:
+        # 训练步骤：前向传播、计算损失等
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+
+    如果不用 nullcontext，你可能需要写两次重复代码：
+    # 不优雅的写法：用 if-else 拆分代码
+    if device_type == "cpu":
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+    else:
+        with torch.cuda.amp.autocast(dtype=dtype):
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+    用了 autocast_ctx 后，直接用一个 with 块就能覆盖两种场景，代码更简洁、易维护。
+    '''
+
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
     # ========== 4. 配wandb ==========
@@ -130,6 +155,8 @@ if __name__ == "__main__":
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    # PyTorch 分布式训练中的采样器选择逻辑，核心作用是：根据是否初始化了分布式环境，决定是否使用「分布式专用采样器（DistributedSampler）」，确保多 GPU 训练时数据不重复、不遗漏，且负载均衡。
+    # 判断当前是否处于「分布式训练环境」（返回 True/False）
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)

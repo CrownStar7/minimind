@@ -378,6 +378,21 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.num_key_value_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
+        '''
+        什么是输入维度 input_dim？
+        输入张量是：
+        [batch, seq_len, hidden_dim]= [32, 511, 512]
+        也就是说：
+        batch = 32：32 个样本
+        seq_len = 511：每个样本有 511 个 token
+        hidden_dim = 512：每个 token 被表示成 512 维向量
+        👉 输入维度 = 512（即每个 token 的 embedding 大小）
+
+        输入维度 = 隐藏层维度 = 一个 token 的向量长度
+        W 的第一维 = 输入维度
+        W 的第二维 = 输出维度
+        输出最后一维 = 输出维度
+        '''
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
@@ -414,27 +429,61 @@ class Attention(nn.Module):
             repeat_kv(xk, self.n_rep).transpose(1, 2),
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
+        '''
+        1. 无掩码时的相似度与权重
+            假设 i=1 时，Q [1] 与所有 j 的相似度为：[2, 3, 4, 5]（j=0、1、2、3）
+            经过 softmax 归一化（计算 exp (x)/sum (exp (all x))）：
+            exp (2)=7.39, exp (3)=20.09, exp (4)=54.60, exp (5)=148.41
+            sum=7.39+20.09+54.60+148.41=230.49
+            权重 = [7.39/230.49≈0.03, 20.09/230.49≈0.09, 54.60/230.49≈0.24, 148.41/230.49≈0.64]
+            输出 [1] = 0.03×V [0] + 0.09×V [1] + 0.24×V [2] + 0.64×V [3]
+        → 包含了后续 j=2、3 的信息，不符合因果逻辑。
+        
+        2. 加掩码后的相似度与权重
+            加因果掩码后，i=1 的相似度变成：[2, 3, -inf, -inf]（j=2、3 被设为 - inf）
+            经过 softmax 归一化：
+            exp (2)=7.39, exp (3)=20.09, exp (-inf)=0, exp (-inf)=0
+            sum=7.39+20.09=27.48
+            权重 = [7.39/27.48≈0.27, 20.09/27.48≈0.73, 0, 0]
+            输出 [1] = 0.27×V [0] + 0.73×V [1] + 0×V [2] + 0×V [3]
+        → 只包含前序 j=0、1 的信息，完全符合 “用前序预测下一个” 的逻辑！
 
+        原始计算是 “所有位置的 V [j] 按相似度加权求和”→ 加掩码后，后续位置的相似度变成 - inf→ softmax 后这些位置的权重为 0→ 加权求和时只用到前序位置的 V [j]→ 输出 [i] 只包含前序信息，刚好用于预测 i+1 位置的 token。
+        
+        必须要有v的原因:q,k负责计算语义信息相关度，v负责生成有语义特征向量
+        0.3×V [A]（A 的语义信息） + 0.7×V [B]（B 的语义信息）→ 生成 “有语义的特征向量
+        '''
         if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
             attn_mask = (
                 None
                 if attention_mask is None
                 else attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1).bool()
             )
-
+            '''
+            is_causal=True：告诉 FlashAttention “这是因果注意力”，内部会自动生成和手动实现完全一样的下三角掩码，并完成 “掩码叠加→softmax” 的过程；
+            '''
             output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            # 生成因果掩码矩阵（下三角掩码）
+            '''
+            关键函数 torch.triu(..., diagonal=1)：triu 是 “上三角矩阵” 的缩写，diagonal=1 表示 “以第 1 条对角线为界”—— 对角线以上的元素保留原值（-inf），对角线及以下的元素设为 0；
+            上三角的数变为负无穷大,进行softmax后,变为0,经过v的加权,最终忽略后面的值,达成只看前面,不管后面的情况
+            '''
             scores = scores + torch.triu(
                 torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
                 diagonal=1
             ).unsqueeze(0).unsqueeze(0)  # scores+mask
-
+            '''
+            1. 作用：屏蔽 “填充 token（padding）” 的信息（比如批量处理时，短文本会被补 0，这些补 0 的 token 是无效的，需要屏蔽）；
+            2. 原理和因果掩码一致：把无效位置设为 - 1e9，softmax 后权重为 0；
+            3. 和因果掩码的区别：因果掩码限制 “时间顺序（不能看后面）”，attention_mask 限制 “token 有效性（不能看填充）”，两者可以叠加使用（分数矩阵会加两个掩码）
+            '''
             if attention_mask is not None:
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
-
+            # softmax 归一化，完成掩码生效
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = scores @ xv
@@ -443,17 +492,22 @@ class Attention(nn.Module):
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
-
+# 比普通 FFN 表现更好，尤其是在大模型中
 class FeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         if config.intermediate_size is None:
             intermediate_size = int(config.hidden_size * 8 / 3)
             config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+        # 将输入投影到中间维度，用作门控
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        # 把经过门控的中间向量投影回原始 hidden_size
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        # 把输入投影到中间维度 → 与 gate_proj 的激活结果相乘
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        # 防止过拟合
         self.dropout = nn.Dropout(config.dropout)
+        # 激活函数只作用在 gate_proj 输出上
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
