@@ -99,12 +99,27 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
 
 def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    # PyTorch 会根据 lm_config 配置，自动初始化模型的所有层，并生成对应的 model.state_dict()（参数名列表）
+    # 后续会根据model.load_state_dict(weights, strict=False),为指定的层读取指定的权重
     model = MiniMindForCausalLM(lm_config)
 
     if from_weight!= 'none':
         moe_suffix = '_moe' if lm_config.use_moe else ''
         weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
         weights = torch.load(weight_path, map_location=device)
+        # PyTorch 的 nn.Module 有一套 “自动命名机制”，所有层的参数名都是按这个规则生成的，无需手动定义：
+        # 命名规则公式：
+        # 
+        '''
+        命名规则公式：
+            参数名 = 父模块名.子模块名.子子模块名....参数类型
+            - 模块名：你在模型类中给层定义的变量名（比如 self.embedding、self.q_proj、self.moe）；
+            - 参数类型：PyTorch 层的内置参数名（比如线性层 nn.Linear 有 weight（权重矩阵）和 bias（偏置向量），嵌入层 nn.Embedding 只有 weight）。
+        关键前提：
+            在模型类中定义层时，必须用 self.xxx 给层分配 “模块名”（比如 self.q_proj = nn.Linear(...)）；
+            嵌套模块（比如模型里包含子模型、子层）会自动拼接模块名（比如 self.model.q_proj.weight）；
+            同名模块？：如果有多个相同类型的层（比如多层 Transformer 编码器），会通过 “索引” 区分（比如 encoder.layers.0.self_attn.q_proj.weight、encoder.layers.1.self_attn.q_proj.weight）。
+        '''
         model.load_state_dict(weights, strict=False)
 
     Logger(f'所加载Model可训练参数：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
