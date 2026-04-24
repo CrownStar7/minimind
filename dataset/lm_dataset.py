@@ -7,6 +7,13 @@ from datasets import load_dataset, Features, Sequence, Value
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def pre_processing_chat(conversations, add_system_ratio=0.2):
+    '''
+    # 20% 概率添加，意味着：
+    # - 80% 样本：模型学会"无 system 也能回答"
+    # - 20% 样本：模型学会"遵循 system 指示"
+
+    # 结果：两种情况都能处理
+    '''
     # tool use 数据完整保留不做处理
     if any(conv.get('tools') for conv in conversations): return conversations
 
@@ -29,6 +36,9 @@ def pre_processing_chat(conversations, add_system_ratio=0.2):
     return conversations
 
 def post_processing_chat(prompt_content, empty_think_ratio=0.2):
+    '''
+    清理训练数据中的无意义空标签，让模型学会"该思考时才思考"。
+    '''
     # 以80%概率移除空思考标签
     if '<think>\n\n</think>\n\n' in prompt_content and random.random() > empty_think_ratio:
         prompt_content = prompt_content.replace('<think>\n\n</think>\n\n', '')
@@ -62,6 +72,15 @@ class SFTDataset(Dataset):
         self.max_length = max_length
         features = Features({'conversations': [{'role': Value('string'), 'content': Value('string'), 'reasoning_content': Value('string'), 'tools': Value('string'), 'tool_calls': Value('string')}]})
         self.samples = load_dataset('json', data_files=jsonl_path, split='train', features=features)
+        '''     
+        self.bos_id:
+        0 =1
+        1 =1388
+        2 =570
+        3 =811
+        4 =234
+        len() =5
+        '''
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
 
@@ -78,13 +97,29 @@ class SFTDataset(Dataset):
             if message.get("tool_calls") and isinstance(message["tool_calls"], str):
                 message["tool_calls"] = json.loads(message["tool_calls"])
             messages.append(message)
+        '''
+        手动拼接
+        def format_chat(messages):
+            prompt = ""
+            for msg in messages:
+                role = msg['role']
+                content = msg['content']
+                # 核心拼接逻辑
+                prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+            return prompt
+        也可以用Hugging Face 标准的 tokenizer，现在流行一种更自动化的做法：apply_chat_template
+        这行代码会去读取 tokenizer_config.json 里的一个 Jinja2 模板，自动把 "role": "user" 映射成 <|im_start|>user
+        '''
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=False,
             tools=tools
         )
-
+    '''
+    labels = [-100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, -100, 25, 234, 463, 4264, 420, 1215, 2508, 357, 337, 349, 712, 2984, 4164, 1642, 51, 49, 59, 597, 2414, 294, ...],
+    input_ids = [1, 832, 311, 234, 349, 712, 2984, 4164, 1642, 51, 49, 59, 597, 2414, 294, 967, 1184, 1180, 1773, 320, 286, 423, 3095, 56, 983, 294, 1184, 1180, 64, 4467, 983, 776, 2, 234, 1, 1388, 570, 811, 234, 25, 234, 463, 4264, 420, 1215, 2508, 357, 337, 349, 712, 2984, 4164, 1642, 51, 49, 59, 597, 2414, 294, ...]
+    '''
     def generate_labels(self, input_ids):
         labels = [-100] * len(input_ids)
         i = 0
@@ -174,6 +209,11 @@ class DPODataset(Dataset):
         }
 
     def generate_loss_mask(self, input_ids):
+        '''
+        loss_mask 负责“算不算损失
+        loss = cross_entropy(logits, labels, reduction='none')   # 每个位置一个 loss
+        loss = loss * loss_mask
+        '''
         loss_mask = [0] * len(input_ids)
         i = 0
         while i < len(input_ids):

@@ -4,3 +4,9 @@ __pycache__/
 out
 website/
 docs-minimind/
+notes/
+dataset/
+minimind-3/
+.vscode/
+.sixth/
+test.py

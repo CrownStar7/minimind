@@ -25,6 +25,9 @@ def logits_to_log_probs(logits, labels):
     # logits shape: (batch_size, seq_len, vocab_size)
     # labels shape: (batch_size, seq_len)
     # log_probs shape: (batch_size, seq_len)
+    # 计算出最后一维6400，softmax后的概率值
+    # 然后交叉熵， $\text{Loss} = -\sum y_i \log(P_i)$，因为在分类任务中，$y_i$ 只有在正确标签位置是 $1$，其余都是 $0$。
+    # 然后用gather寻找对应值，这个动作代表1，未被取出的为0，然后计算-log，然后把剩下所有位置这样做，计算出一个平均loss
     log_probs = F.log_softmax(logits, dim=2)
     log_probs_per_token = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
     return log_probs_per_token
@@ -41,10 +44,22 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     reject_ref_log_probs = ref_log_probs[batch_size // 2:]
     chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
     reject_policy_log_probs = policy_log_probs[batch_size // 2:]
-
+    # 学“好答案相对坏答案要更好
     pi_logratios = chosen_policy_log_probs - reject_policy_log_probs
+    # 学“好答案相对坏答案要更好
     ref_logratios = chosen_ref_log_probs - reject_ref_log_probs
+    # 这是在做“相对改进”：不是让新模型无脑偏向 chosen，而是让当前模型对 chosen 相对 rejected 的偏好程度，\
+    # 超过参考模型，新模型比参考模型，是否更偏向 chosen，防止模型跑偏太远
     logits = pi_logratios - ref_logratios
+    '''
+    z = beta * logits
+    loss = -log(sigmoid(z))
+    z 很大, sigmoid(z) ≈ 1, log(sigmoid(z)) ≈ 0,loss ≈ 0, 再取负，就越大
+    
+    beta 是一个缩放系数，控制“偏好优化的力度”。
+    beta 大：更激进，更强调拉开 chosen/rejected 差距
+    beta 小：更保守
+    '''
     loss = -F.logsigmoid(beta * logits)
     return loss.mean()
 
@@ -179,10 +194,11 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型和参考模型 ==========
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    tokenizer_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../model"))
+    model, tokenizer = init_model(lm_config, args.from_weight, tokenizer_path=tokenizer_path, device=args.device)
     Logger(f'策略模型总参数量：{sum(p.numel() for p in model.parameters()) / 1e6:.3f} M')
     # 初始化参考模型（ref_model冻结）
-    ref_model, _ = init_model(lm_config, args.from_weight, device=args.device)
+    ref_model, _ = init_model(lm_config, args.from_weight, tokenizer_path=tokenizer_path, device=args.device)
     ref_model.eval()
     ref_model.requires_grad_(False)
     Logger(f'参考模型总参数量：{sum(p.numel() for p in ref_model.parameters()) / 1e6:.3f} M')

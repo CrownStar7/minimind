@@ -125,7 +125,8 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、应用LoRA、冻结非LoRA参数 ==========
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    tokenizer_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../model"))
+    model, tokenizer = init_model(lm_config, args.from_weight, tokenizer_path=tokenizer_path, device=args.device)
     apply_lora(model)
     
     # 统计参数
@@ -135,7 +136,13 @@ if __name__ == "__main__":
     Logger(f"LoRA 参数量: {lora_params_count / 1e6:.3f} M")
     Logger(f"LoRA 参数占比: {lora_params_count / total_params * 100:.2f}%")
     
-    # 冻结非LoRA参数，收集LoRA参数
+    '''
+    冻结非LoRA参数，收集LoRA参数
+    param.requires_grad = False 跳过, True：参与梯度计算和更新
+        1,反向传播时不计算这些参数的梯度
+        2,optimizer 也不会更新它们
+        3,原模型权重保持不变
+    '''
     lora_params = []
     for name, param in model.named_parameters():
         if 'lora' in name:
@@ -148,6 +155,7 @@ if __name__ == "__main__":
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
+    # 由优化器控制  最终只有 LoRA 在学，底座模型不动
     optimizer = optim.AdamW(lora_params, lr=args.learning_rate)
     
     # ========== 7. 从ckp恢复状态 ==========
